@@ -1,0 +1,105 @@
+USE [<DB>]
+GO
+/****** Object:  StoredProcedure [dbo].[ManageBlockingProcess]    Script Date: 7/13/2020 9:11:26 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+
+ALTER PROCEDURE [dbo].[ManageBlockingProcess]
+AS
+BEGIN
+
+--1. Scan the sysprocesses for blocking session
+
+Declare @@blockerSession int
+Declare @@textValue nvarchar(MAX)
+Declare @@currentHostName nvarchar(20)
+Declare @@currentLoginName nvarchar(20)
+SET @@BlockerSession = (Select sp.spid
+						From master..sysprocesses sp cross apply sys.dm_exec_sql_text(Sql_handle) dm 
+						where Sql_handle <> 0x00
+						and spid IN (Select blocked from master..sysprocesses where waittime > 20000 ) --20 Second
+						and loginame NOT LIKE '%<SystemUser>%'
+						--Put Other Exceptions here which you don't want to kill.
+						)
+IF (@@BlockerSession IS NULL)
+goto TheEndOfTheScript;
+
+--Set Different Values to global variables
+SET @@textValue = (Select dm.text
+From master..sysprocesses sp1 cross apply sys.dm_exec_sql_text(Sql_handle) dm 
+where spid = @@BlockerSession)
+SET @@currentHostName =  (Select sp1.hostname
+From master..sysprocesses sp1 cross apply sys.dm_exec_sql_text(Sql_handle) dm 
+where spid = @@BlockerSession)
+SET @@currentLoginName =  (Select sp1.loginame
+From master..sysprocesses sp1 cross apply sys.dm_exec_sql_text(Sql_handle) dm 
+where spid = @@BlockerSession)
+--
+
+--2. Scan Session Table from NAV and Save the record
+drop table if exists #tempActiveSessionBefore
+select *
+into #tempActiveSessionBefore
+from [dbo].[Active Session]
+
+--select * from #tempActiveSession
+--Select * from [dbo].[Active Session]
+
+--3. Kill the blocking process from sysprocesses in SQL
+DECLARE @SQL nvarchar(1000)
+SET @SQL = 'KILL ' + CAST(@@BlockerSession as varchar(4))
+
+EXEC (@SQL)
+
+
+
+--4. Scan Session Table fro NAV, 2nd time, and find the missing record
+drop table if exists #tempActiveSessionAfter
+select *
+into #tempActiveSessionAfter
+from [dbo].[Active Session]
+
+--5. Find the missing record in ActiveSession table
+
+SELECT #tempActiveSessionBefore.[User ID]
+FROM #tempActiveSessionBefore
+    LEFT JOIN #tempActiveSessionAfter ON (#tempActiveSessionBefore.[User ID] = #tempActiveSessionAfter.[User ID])
+WHERE #tempActiveSessionAfter.[User ID] IS NULL
+
+--6. Scan the user id from that record and send email to that user
+--Send Notification Email before Killing the process
+--declare @emailList nvarchar(256)
+declare @userList nvarchar(256)
+declare @emailText nvarchar(500)
+declare @currDate datetime
+Set @currDate = (SELECT SYSDATETIME())
+
+set @emailText =  ('SYSTEM TERMINATED YOUR CURRENT NAV SESSION BECAUSE OF BLOCKING ISSUE ON THE SERVER.' 
+					+ CHAR(13) + CHAR(10) + CHAR(13) + CHAR(10) +'  User ID : ' + Convert(varchar,@@currentLoginName)
+					+ CHAR(13) + CHAR(10) + '  HostName : '+ Convert(varchar,@@currentHostName)
+					+ CHAR(13) + CHAR(10) + CHAR(13) + CHAR(10) + 'QUERY: ' 
+					+ CHAR(13) + CHAR(10) + ' -----START----- '+ LEFT(@@textValue,250)
+					+ CHAR(13) + CHAR(10) + ' ------END------ '+
+					+ CHAR(13) + CHAR(10)+ CHAR(13) + CHAR(10) + 'Please try log in back. Thank you.')
+
+--select @emailText
+set @userList = (
+SELECT #tempActiveSessionBefore.[User ID]
+FROM #tempActiveSessionBefore
+    LEFT JOIN #tempActiveSessionAfter ON (#tempActiveSessionBefore.[User ID] = #tempActiveSessionAfter.[User ID])
+WHERE #tempActiveSessionAfter.[User ID] IS NULL)
+
+--set @emailList =  (select [<DB>].[dbo].EmailByID(@userList)) --use @userid instead
+--
+EXEC msdb.dbo.sp_send_dbmail  
+    @profile_name = '<SQLDBMail>',  
+    @recipients = 'rabins@hotmail.com', --@emailList,  
+    @body = @emailText,  
+    @subject = 'SQL Process Blocker Alert' ; 
+
+TheEndOfTheScript:
+END
